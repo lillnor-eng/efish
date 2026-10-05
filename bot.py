@@ -30,7 +30,7 @@ DRY_RUN = env("DRY_RUN", "true").lower() != "false"
 SELF_VOTE = env("SELF_VOTE", "false").lower() == "true"
 FORCE = env("FORCE", "false").lower() == "true"  # post even if something was already posted today
 POST_COMMUNITY = env("POST_COMMUNITY")  # e.g. hive-xxxxx, empty = personal blog
-TAGS = [t.strip().lower() for t in (env("TAGS") or "inleo,crypto,research").split(",") if t.strip()]
+TAGS = [t.strip().lower() for t in (env("TAGS") or "inleo,crypto,hive-engine,neoxian,proofofbrain,archon,waiv").split(",") if t.strip()]
 QUERY = env("ARXIV_QUERY") or (
     'abs:cryptocurrency OR abs:blockchain OR abs:"decentralized finance" OR abs:bitcoin '
     "OR abs:ethereum OR abs:DeFi OR abs:stablecoin")
