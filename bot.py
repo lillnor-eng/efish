@@ -37,8 +37,7 @@ QUERY = env("ARXIV_QUERY") or (
 MAX_RESULTS = int(env("MAX_RESULTS", "40"))
 MIN_ABSTRACT_CHARS = int(env("MIN_ABSTRACT_CHARS", "500"))
 DISCLOSURE = env("DISCLOSURE") or (
-    "*This post is an automated research note, written with the help of AI from the paper's "
-    "abstract. It is not financial advice.*")
+    "*This is not financial advice. The information provided is for educational and informational purposes only.*")
 
 SYSTEM = (
     "You write a short blog post in English for readers who are curious about crypto, based ONLY on "
