@@ -1,0 +1,238 @@
+"""Daily post job with encrypted state."""
+import datetime as dt
+import json
+import os
+import random
+import re
+import time
+import xml.etree.ElementTree as ET
+
+import requests
+from cryptography.fernet import Fernet
+from nectar import Hive
+
+API = "https://api.hive.blog"
+ARXIV_API = "https://export.arxiv.org/api/query"
+STATE_FILE = "state.enc"
+ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+def env(name, default=""):
+    return os.environ.get(name) or default
+
+
+ACCOUNT = env("HIVE_ACCOUNT")
+POSTING_KEY = env("HIVE_POSTING_KEY")
+MODEL = env("MODEL", "gemini-3.5-flash")
+LLM_KEY = env("GEMINI_API_KEY")
+LLM_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+DRY_RUN = env("DRY_RUN", "true").lower() != "false"
+SELF_VOTE = env("SELF_VOTE", "false").lower() == "true"
+FORCE = env("FORCE", "false").lower() == "true"  # post even if something was already posted today
+POST_COMMUNITY = env("POST_COMMUNITY")  # e.g. hive-xxxxx, empty = personal blog
+TAGS = [t.strip().lower() for t in (env("TAGS") or "inleo,crypto,research").split(",") if t.strip()]
+QUERY = env("ARXIV_QUERY") or (
+    'abs:cryptocurrency OR abs:blockchain OR abs:"decentralized finance" OR abs:bitcoin '
+    "OR abs:ethereum OR abs:DeFi OR abs:stablecoin")
+MAX_RESULTS = int(env("MAX_RESULTS", "40"))
+MIN_ABSTRACT_CHARS = int(env("MIN_ABSTRACT_CHARS", "500"))
+DISCLOSURE = env("DISCLOSURE") or (
+    "*This post is an automated research note, written with the help of AI from the paper's "
+    "abstract. It is not financial advice.*")
+
+SYSTEM = (
+    "You write a short blog post in English for readers who are curious about crypto, based ONLY on "
+    "the academic paper title and abstract you are given. Write like a relaxed human blogger "
+    "chatting with readers: contractions, short sentences mixed with longer ones, plain everyday "
+    "words, a bit of humor if it fits.\n\n"
+    "OUTPUT FORMAT, exactly this and nothing else:\n"
+    "TITLE: <catchy but honest title, max 80 characters, no colon>\n"
+    "<blank line>\n"
+    "<paragraph 1>\n"
+    "<blank line>\n"
+    "<paragraph 2>\n\n"
+    "Paragraph 1 (3-4 sentences): a friendly, chatty opening that talks straight to the reader and "
+    "connects the paper's theme to a situation many crypto users know. Do NOT invent personal events: "
+    "never claim you personally traded, lost money, tried something or saw something happen. "
+    "You may say you came across or read the study.\n"
+    "Paragraph 2 (5-7 sentences): explain in plain words what question the researchers asked, how "
+    "they approached it and what they found, using only facts in the abstract. If the abstract does "
+    "not state a result, say honestly that it does not.\n\n"
+    "STYLE RULES, never break them: no em dashes or en dashes (use a comma or a new sentence). No "
+    "Oxford comma, so write A, B and C, never A, B, and C. No quotation marks of any kind. No "
+    "semicolons, no emojis, no bullet points, no headings, no markdown. Avoid stock AI phrases such "
+    "as delve, dive into, landscape, tapestry, game-changer, it's worth noting, in conclusion, "
+    "ever-evolving, and avoid the not just X but Y pattern.\n"
+    "CONTENT RULES: never invent numbers, percentages, institutions, author names or quotes; use a "
+    "number only if it appears in the abstract. No investment advice, price predictions or buy/sell "
+    "hints. No links or URLs and no source paragraph (it is added automatically)."
+)
+BANNED = re.compile(r"\b(delve\w*|dive into|landscapes?|tapestry|game-changer|it's worth noting|"
+                    r"in conclusion|ever-evolving|unlock\w*)\b", re.I)
+
+
+# ---------- encrypted state ----------
+def load_state():
+    f = Fernet(env("STATE_KEY").encode())
+    base = {"posted": [], "last_post_date": ""}
+    if not os.path.exists(STATE_FILE):
+        return f, base
+    with open(STATE_FILE, "rb") as fh:
+        base.update(json.loads(f.decrypt(fh.read())))
+    return f, base
+
+
+def save_state(f, state):
+    with open(STATE_FILE, "wb") as fh:
+        fh.write(f.encrypt(json.dumps(state).encode()))
+
+
+# ---------- source papers ----------
+def squash(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def fetch_papers():
+    r = requests.get(
+        ARXIV_API,
+        params={"search_query": QUERY, "sortBy": "submittedDate", "sortOrder": "descending",
+                "start": 0, "max_results": MAX_RESULTS},
+        headers={"User-Agent": "paper-post/1.0"}, timeout=60)
+    r.raise_for_status()
+    papers = []
+    for e in ET.fromstring(r.content).findall(f"{ATOM}entry"):
+        raw_id = squash(e.findtext(f"{ATOM}id"))
+        arxiv_id = re.sub(r"v\d+$", "", raw_id.split("/abs/")[-1])
+        papers.append({
+            "id": arxiv_id,
+            "title": squash(e.findtext(f"{ATOM}title")),
+            "abstract": squash(e.findtext(f"{ATOM}summary")),
+            "authors": [squash(a.findtext(f"{ATOM}name")) for a in e.findall(f"{ATOM}author")],
+        })
+    return papers
+
+
+def pick_paper(papers, posted):
+    for p in papers:
+        if p["id"] not in posted and len(p["abstract"]) >= MIN_ABSTRACT_CHARS and p["title"]:
+            return p
+    return None
+
+
+# ---------- text generation ----------
+def llm_post(**kw):
+    """POST to Gemini, retrying only on temporary server errors (a 429 is not retried)."""
+    for i in range(3):
+        r = requests.post(LLM_URL, **kw)
+        if r.status_code in (500, 502, 503, 504) and i < 2:
+            time.sleep(20 * (i + 1) + random.randint(0, 5))
+            continue
+        r.raise_for_status()
+        return r
+
+
+def numbers(text):
+    return {n.replace(",", ".") for n in re.findall(r"\d+(?:[.,]\d+)?", text)}
+
+
+_LIST = re.compile(r"(\b[\w'-]+(?: [\w'-]+){0,2}, [\w'-]+(?: [\w'-]+){0,2}), (and|or) ")
+
+
+def clean(text):
+    """Safety net for the style rules: dashes, quotation marks, Oxford comma."""
+    text = re.sub(r"(?<=\d)[\u2013\u2014](?=\d)", "-", text)      # number ranges keep a hyphen
+    text = re.sub(r"\s*[\u2013\u2014]\s*", ", ", text)              # em/en dash -> comma
+    text = text.replace("\u2019", "'").replace("\u2018", "")
+    text = re.sub(r"[\"\u201c\u201d\u00ab\u00bb]", "", text)           # no quotation marks
+    text = re.sub(r";\s+(\w)", lambda m: ". " + m.group(1).upper(), text).replace(";", ".")
+    return _LIST.sub(r"\1 \2 ", text)                               # A, B, and C -> A, B and C
+
+
+def generate(paper):
+    """Returns (title, [paragraph1, paragraph2]) or None if the draft fails the checks."""
+    r = llm_post(
+        headers={"x-goog-api-key": LLM_KEY, "Content-Type": "application/json"},
+        json={"systemInstruction": {"parts": [{"text": SYSTEM}]},
+              "contents": [{"role": "user", "parts": [
+                  {"text": f"Title: {paper['title']}\n\nAbstract: {paper['abstract']}"}]}],
+              "generationConfig": {"maxOutputTokens": 4096, "temperature": 0.8}},
+        timeout=90)
+    cand = r.json()["candidates"][0]
+    if cand.get("finishReason") not in (None, "STOP"):
+        return None  # cut off or blocked, never post a partial text
+    text = clean("".join(p.get("text", "") for p in cand["content"]["parts"]).strip())
+    m = re.match(r"TITLE:\s*(.+?)\s*\n\s*\n(.+)", text, re.S)
+    if not m:
+        return None
+    title = m.group(1).strip().strip("*# ")
+    paras = [squash(x) for x in re.split(r"\n\s*\n", m.group(2).strip()) if x.strip()]
+    if not title or len(title) > 90 or len(paras) != 2 or any(len(x) < 200 for x in paras):
+        return None
+    body = " ".join(paras) + " " + title
+    if re.search(r"https?://|www\.|\.com\b", body, re.I) or BANNED.search(body):
+        return None  # no links, no stock AI phrases
+    if not numbers(body) <= numbers(paper["title"] + " " + paper["abstract"]):
+        return None  # a number that is not in the abstract would be invented
+    return title, paras
+
+
+def author_names(authors):
+    a = [clean(x) for x in authors[:3]]
+    if not a:
+        return "the researchers"
+    who = a[0] if len(a) == 1 else f"{a[0]} and {a[1]}" if len(a) == 2 else f"{a[0]}, {a[1]} and {a[2]}"
+    return who + (", with several coauthors" if len(authors) > 3 else "")
+
+
+def source_paragraph(paper):
+    who, ref, title = author_names(paper["authors"]), f"arxiv.org/abs/{paper['id']}", clean(paper["title"])
+    return random.choice([
+        f"If you want the full details, the paper is called *{title}* and it was written by {who}. "
+        f"You can find it at {ref}.",
+        f"The study behind all this is *{title}* by {who}. It lives at {ref} if you feel like reading "
+        f"more. I only tried to make the abstract easier to digest.",
+        f"Curious about the details? Look up *{title}* at {ref}. The authors are {who}.",
+    ])
+
+
+def main():
+    fernet, state = load_state()
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    if state["last_post_date"] == today and not FORCE:
+        print("already posted today")
+        return
+
+    paper = pick_paper(fetch_papers(), set(state["posted"]))
+    if not paper:
+        print("no new paper found")
+        return
+    print("paper:", paper["id"], paper["title"][:80])
+
+    draft = None
+    for _ in range(3):
+        draft = generate(paper)
+        if draft:
+            break
+        time.sleep(15)
+    if not draft:
+        print("draft failed the checks, nothing posted")
+        return
+    title, paras = draft
+    body = "\n\n".join(paras + [source_paragraph(paper), "---", DISCLOSURE])
+
+    if DRY_RUN:
+        print(f"[dry run] title: {title}\n\n{body}\n")
+        return
+
+    permlink = "research-note-" + paper["id"].replace(".", "-").replace("/", "-")
+    hive = Hive(node=[API], keys=[POSTING_KEY])
+    hive.post(title=title, body=body, author=ACCOUNT, permlink=permlink, tags=TAGS,
+              community=POST_COMMUNITY or None, self_vote=SELF_VOTE)
+    state["posted"] = (state["posted"] + [paper["id"]])[-500:]
+    state["last_post_date"] = today
+    save_state(fernet, state)
+    print("posted:", permlink)
+
+
+if __name__ == "__main__":
+    main()
