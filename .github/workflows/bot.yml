@@ -2,7 +2,7 @@ name: sync
 
 on:
   schedule:
-    - cron: "17 14 * * *"
+    - cron: "0 8 * * *"
   workflow_dispatch:
 
 permissions:
@@ -40,6 +40,7 @@ jobs:
           SELF_VOTE: ${{ vars.SELF_VOTE }}
           ARXIV_QUERY: ${{ vars.ARXIV_QUERY }}
           IMAGES: ${{ vars.IMAGES }}
+          APP_NAME: ${{ vars.APP_NAME }}
           FORCE: ${{ vars.FORCE }}
         run: python bot.py
 
