@@ -29,6 +29,7 @@ jobs:
         env:
           HIVE_POSTING_KEY: ${{ secrets.HIVE_POSTING_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           STATE_KEY: ${{ secrets.STATE_KEY }}
           DISCLOSURE: ${{ secrets.DISCLOSURE }}
           HIVE_ACCOUNT: ${{ vars.HIVE_ACCOUNT }}
@@ -38,6 +39,7 @@ jobs:
           TAGS: ${{ vars.TAGS }}
           SELF_VOTE: ${{ vars.SELF_VOTE }}
           ARXIV_QUERY: ${{ vars.ARXIV_QUERY }}
+          IMAGES: ${{ vars.IMAGES }}
           FORCE: ${{ vars.FORCE }}
         run: python bot.py
 
