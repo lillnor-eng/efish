@@ -1,3 +1,4 @@
 hive-nectar
 cryptography
 requests
+pillow
